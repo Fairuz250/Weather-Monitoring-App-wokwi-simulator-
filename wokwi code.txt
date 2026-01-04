@@ -1,0 +1,162 @@
+#include <Adafruit_Sensor.h>
+#include <DHT_U.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ESP32Servo.h>
+#include <FastLED.h>
+
+// ---------------- PIN DEFINITIONS ----------------
+#define DHTPIN 12
+#define DHTTYPE DHT22
+
+#define LED 26
+#define SERVO_PIN 2
+#define LED_PIN 4
+#define NUM_LEDS 16
+
+#define LDR_PIN 34   // Photoresistor ADC input
+
+// ---------------- OBJECTS ----------------
+DHT_Unified dht(DHTPIN, DHTTYPE);
+Servo servo;
+CRGB leds[NUM_LEDS];
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ---------------- WIFI + MQTT ----------------
+const char* ssid = "Wokwi-GUEST";
+const char* password = "";
+const char* mqttServer = "broker.hivemq.com";
+const char* clientID = "esp32_client_001";
+const char* topic = "Tempdata";
+
+unsigned long previousMillis = 0;
+const long interval = 1000;
+
+float temp, hum;
+String msgStr;
+
+// ---------------- WIFI SETUP ----------------
+void setup_wifi() {
+  Serial.print("Connecting to WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ---------------- MQTT RECONNECT ----------------
+void reconnect() {
+  while (!client.connected()) {
+    if (client.connect(clientID)) {
+      Serial.println("MQTT connected");
+      client.subscribe("lights");
+      client.subscribe("servo");
+      client.subscribe("lights/neopixel");
+    } else {
+      Serial.print("Failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" retry in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+// ---------------- MQTT CALLBACK ----------------
+void callback(char* topic, byte* payload, unsigned int length) {
+  String data = "";
+  for (int i = 0; i < length; i++) data += (char)payload[i];
+
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("]: ");
+  Serial.println(data);
+
+  if (String(topic) == "lights") {
+    digitalWrite(LED, (data == "ON") ? HIGH : LOW);
+  }
+  else if (String(topic) == "servo") {
+    int degree = data.toInt();
+    servo.write(degree);
+  }
+  else if (String(topic) == "lights/neopixel") {
+    int r, g, b;
+    sscanf(data.c_str(), "%d,%d,%d", &r, &g, &b);
+    fill_solid(leds, NUM_LEDS, CRGB(r, g, b));
+    FastLED.show();
+  }
+}
+
+// ---------------- LUX FUNCTION (YOUR EXACT FORMULA) ----------------
+float readLuxExact() {
+  const float GAMMA = 0.7;
+  const float RL10  = 85;  // reference resistance at 10 lux
+
+  int analogValue = analogRead(LDR_PIN);       // 0–4095
+  float voltage = analogValue * (3.3 / 4095.0);
+
+  if (voltage >= 3.3) voltage = 3.29;         // avoid divide by zero
+
+  float resistance = 5000.0 * voltage / (1.0 - voltage / 3.3); // matches your Python formula
+  float lux = pow(RL10 * 1000.0 * pow(10.0, GAMMA) / resistance, 1.0 / GAMMA);
+
+  return lux;
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+
+  dht.begin();
+  pinMode(LED, OUTPUT);
+  digitalWrite(LED, LOW);
+
+  servo.attach(SERVO_PIN);
+  servo.write(0);
+
+  FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
+
+  setup_wifi();
+  client.setServer(mqttServer, 1883);
+  client.setCallback(callback);
+
+  pinMode(LDR_PIN, INPUT);
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+
+    sensors_event_t event;
+
+    // ---- Temperature ----
+    dht.temperature().getEvent(&event);
+    temp = event.temperature;
+
+    // ---- Humidity ----
+    dht.humidity().getEvent(&event);
+    hum = event.relative_humidity;
+
+    // ---- Lux ----
+    float lux = readLuxExact();
+
+    // ---- Serial Debug ----
+    Serial.print("Temp: "); Serial.print(temp);
+    Serial.print(" °C | Hum: "); Serial.print(hum);
+    Serial.print(" % | Lux: "); Serial.println(lux);
+
+    // ---- MQTT Publish ----
+    msgStr = String(temp) + "," + String(hum) + "," + String(lux);
+    client.publish(topic, msgStr.c_str());
+  }
+}
